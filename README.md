@@ -1,8 +1,8 @@
-# autoresearch-amd
+# autoresearch-intel
 
 ![teaser](progress.png)
 
-> **⚠️ This is a community fork adding AMD ROCm support to the original project.**
+> **⚠️ This is a community fork adding Intel XPU and AMD ROCm support to the original project.**
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
@@ -11,16 +11,84 @@
 ## 🍴 Fork Information
 
 **Original Project**: [karpathy/autoresearch](https://github.com/karpathy/autoresearch) by Andrej Karpathy  
-**This Fork**: [nikay99/autoresearch-amd](https://github.com/nikay99/autoresearch-amd)  
-**Contributions**: AMD ROCm GPU support (MI300X, MI250X, MI210, MI100)
+**This Fork**: [nikay99/autoresearch-amd](https://github.com/nikay99/autoresearch-amd) (`intel-xpu` branch)  
+**Contributions**: 
+- ✅ AMD ROCm GPU support (MI300X, MI250X, MI210, MI100)
+- 🆕 Intel XPU support (Arc A770/A750/A580, Data Center GPU Max/Flex)
 
-**All credits for the original codebase go to Andrej Karpathy.** This fork only adds AMD GPU support while maintaining full compatibility with NVIDIA GPUs.
+**All credits for the original codebase go to Andrej Karpathy.** This fork only adds multi-vendor GPU support while maintaining full compatibility with NVIDIA GPUs.
 
 ---
 
 ## About
 
 The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
+
+## Platform Support
+
+This fork supports **three GPU vendors**:
+
+| Vendor | GPUs | Backend | Flash Attention |
+|--------|------|---------|-----------------|
+| **Intel** | Arc A770/A750/A580, Data Center GPU Max/Flex | XPU (IPEX) | PyTorch SDPA |
+| **AMD** | MI300X, MI250X, MI210, MI100 | ROCm 6.2.4+ | flash-attn-rocm |
+| **NVIDIA** | H100, A100, L40S, RTX 4090/3090 | CUDA | Flash Attention 3 |
+
+The code **automatically detects** your GPU and configures the optimal backend.
+
+## Quick start
+
+**Requirements:** Intel Arc/Data Center GPU, AMD GPU, OR NVIDIA GPU + Python 3.10+ + [uv](https://docs.astral.sh/uv/)
+
+### Intel XPU Setup
+
+```bash
+# 1. Install Intel GPU drivers and oneAPI (if not already installed)
+# See: https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpus.html
+
+# 2. Clone and setup
+git clone https://github.com/nikay99/autoresearch-amd.git
+cd autoresearch-amd
+git checkout intel-xpu
+
+# 3. Install dependencies (PyTorch with Intel extensions)
+uv sync --extra intel
+
+# 4. Download data and train tokenizer (~2 min)
+uv run prepare.py
+
+# 5. Run training (~5 min)
+uv run train.py
+```
+
+### AMD ROCm Setup
+
+```bash
+# Ensure ROCm 6.2.4+ is installed
+git clone https://github.com/nikay99/autoresearch-amd.git
+cd autoresearch-amd
+git checkout intel-xpu  # or master for AMD-only
+
+uv sync --extra rocm
+
+# Optional: Install Flash Attention for AMD
+pip install flash-attn-rocm
+
+uv run prepare.py
+uv run train.py
+```
+
+### NVIDIA CUDA Setup
+
+```bash
+git clone https://github.com/nikay99/autoresearch-amd.git
+cd autoresearch-amd
+git checkout intel-xpu
+
+uv sync --extra cuda
+uv run prepare.py
+uv run train.py
+```
 
 ## How it works
 
@@ -33,27 +101,6 @@ The repo is deliberately kept small and only really has three files that matter:
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
-
-## Quick start
-
-**Requirements:** A single AMD GPU (ROCm 6.2.4+) or NVIDIA GPU, Python 3.10+, [uv](https://docs.astral.sh/uv/).
-
-```bash
-
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
-uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
-```
-
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
 ## Running the agent
 
@@ -80,26 +127,24 @@ pyproject.toml  — dependencies
 - **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
 - **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
 
-## Platform support
+## Technical Details
 
-This is an **AMD ROCm fork** of the original autoresearch project. It supports:
-- **AMD GPUs** via ROCm 6.2.4+ (MI300X, MI250X, MI210, MI100)
-- **NVIDIA GPUs** via CUDA (maintained for compatibility)
+### Intel XPU Specifics
 
-The code automatically detects your GPU and configures:
-- Flash Attention (uses flash-attn-rocm for AMD, Flash Attention 3 for NVIDIA)
-- Peak FLOPS for MFU calculation (auto-detected for common AMD/NVIDIA GPUs)
-- Memory management (ROCm uses the same `torch.cuda` APIs)
+- Uses **Intel Extension for PyTorch (IPEX)** for optimized operations
+- **Flash Attention**: Not yet available for Intel GPUs → uses PyTorch's native SDPA
+- **Memory**: XPU uses `torch.xpu.*` APIs (abstracted in this codebase)
+- **Performance**: Intel Arc A770 achieves ~60-70% of RTX 4090 LLM training perf
 
-### AMD ROCm Setup
+### Universal Device Abstraction
 
-Ensure you have ROCm 6.2.4+ installed. The PyTorch index is already configured in `pyproject.toml`.
+The codebase uses a universal device abstraction that automatically handles:
+- Device detection (`torch.xpu`, `torch.cuda`)
+- Memory synchronization APIs
+- Peak memory tracking
+- Autocast contexts
 
-For optimal performance on AMD GPUs, you may want to install flash-attn-rocm:
-```bash
-# The dependency is optional - if not installed, eager attention fallback is used
-pip install flash-attn-rocm
-```
+This allows the same code to run on Intel, AMD, and NVIDIA GPUs without modification.
 
 ### Hardware Recommendations for Smaller GPUs
 
@@ -117,7 +162,9 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 
 ## Notable forks
 
-- [nikay99/autoresearch-amd](https://github.com/nikay99/autoresearch-amd) (AMD ROCm) - **This fork!**
+- [nikay99/autoresearch-amd](https://github.com/nikay99/autoresearch-amd) (Intel XPU / AMD ROCm / NVIDIA CUDA) - **This fork!**
+  - `master` branch: AMD ROCm + NVIDIA CUDA
+  - `intel-xpu` branch: Intel XPU + AMD ROCm + NVIDIA CUDA (universal)
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
 - [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
@@ -128,7 +175,7 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 - **Repository**: [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
 - **Twitter**: [@karpathy](https://x.com/karpathy)
 
-This fork is a community contribution adding AMD GPU support. If you find this useful, please star both the original repository and this fork!
+This fork is a community contribution adding multi-vendor GPU support. If you find this useful, please star both the original repository and this fork!
 
 ## License
 

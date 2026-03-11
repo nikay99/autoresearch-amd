@@ -2,6 +2,8 @@
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
+
+Supports: Intel XPU, AMD ROCm, NVIDIA CUDA
 """
 
 import os
@@ -18,57 +20,125 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ROCm/AMD GPU detection and Flash Attention setup
-def get_flash_attention_fn():
-    """Get Flash Attention function for AMD ROCm or fallback to eager attention."""
-    if not torch.cuda.is_available():
-        return None
-    
-    # Check if we're on AMD ROCm
-    if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-        try:
-            # Try flash-attn-rocm for AMD GPUs
-            from flash_attn_rocm import flash_attn_func
-            print("Using flash-attn-rocm for AMD GPU")
-            return flash_attn_func
-        except ImportError:
-            print("Warning: flash-attn-rocm not installed, using eager attention fallback")
-            return None
-    else:
-        # NVIDIA path - use kernels package
-        try:
-            from kernels import get_kernel
-            cap = torch.cuda.get_device_capability()
-            repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-            fa3 = get_kernel(repo).flash_attn_interface
-            print(f"Using Flash Attention 3 from {repo}")
-            return fa3.flash_attn_func
-        except Exception as e:
-            print(f"Warning: Could not load Flash Attention: {e}")
-            return None
+# ---------------------------------------------------------------------------
+# Universal Device Abstraction (Intel XPU / AMD ROCm / NVIDIA CUDA)
+# ---------------------------------------------------------------------------
 
-# Global flash attention function (may be None if not available)
-_flash_attn_func = None
+def get_device_type():
+    """Detect available accelerator: 'xpu' (Intel), 'cuda' (AMD/NVIDIA), or None."""
+    # Check Intel XPU first
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return "xpu"
+    # Check CUDA (covers both AMD ROCm and NVIDIA)
+    elif torch.cuda.is_available():
+        return "cuda"
+    return None
 
-def flash_attn_wrapper(q, k, v, causal=True, window_size=(-1, -1)):
-    """Wrapper that uses flash attention if available, otherwise falls back to eager."""
-    global _flash_attn_func
-    if _flash_attn_func is None:
-        _flash_attn_func = get_flash_attention_fn()
+def get_device():
+    """Get the best available device."""
+    device_type = get_device_type()
+    if device_type == "xpu":
+        device_name = torch.xpu.get_device_name(0)
+        print(f"Using Intel XPU device: {device_name}")
+        return torch.device("xpu:0")
+    elif device_type == "cuda":
+        device_name = torch.cuda.get_device_name(0)
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            print(f"Using AMD ROCm device: {device_name}")
+        else:
+            print(f"Using NVIDIA CUDA device: {device_name}")
+        return torch.device("cuda")
+    raise RuntimeError("No GPU available - Intel XPU, ROCm, or CUDA required")
+
+def device_synchronize(device_type=None):
+    """Synchronize device (universal)."""
+    if device_type is None:
+        device_type = get_device_type()
+    if device_type == "xpu":
+        torch.xpu.synchronize()
+    elif device_type == "cuda":
+        torch.cuda.synchronize()
+
+def get_max_memory_allocated(device_type=None):
+    """Get max memory allocated (universal)."""
+    if device_type is None:
+        device_type = get_device_type()
+    if device_type == "xpu":
+        return torch.xpu.max_memory_allocated()
+    elif device_type == "cuda":
+        return torch.cuda.max_memory_allocated()
+    return 0
+
+def device_manual_seed(seed, device_type=None):
+    """Set device random seed (universal)."""
+    if device_type is None:
+        device_type = get_device_type()
+    if device_type == "xpu":
+        torch.xpu.manual_seed(seed)
+    elif device_type == "cuda":
+        torch.cuda.manual_seed(seed)
+
+# ---------------------------------------------------------------------------
+# Flash Attention Setup (Intel XPU / AMD ROCm / NVIDIA CUDA)
+# ---------------------------------------------------------------------------
+
+def get_flash_attention_fn(device_type=None):
+    """Get optimized attention function for the current device."""
+    if device_type is None:
+        device_type = get_device_type()
     
-    if _flash_attn_func is not None:
-        try:
-            return _flash_attn_func(q, k, v, causal=causal, window_size=window_size)
-        except Exception as e:
-            # Fallback on any flash attention error
-            pass
+    if device_type == "xpu":
+        # Intel XPU: Use PyTorch SDPA (no native Flash Attention yet)
+        print("Using PyTorch SDPA for Intel XPU")
+        return sdpa_attention
     
-    # Eager attention fallback (SDPA or manual implementation)
-    return eager_attention(q, k, v, causal, window_size)
+    elif device_type == "cuda":
+        # Check if we're on AMD ROCm
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            try:
+                from flash_attn_rocm import flash_attn_func
+                print("Using flash-attn-rocm for AMD GPU")
+                return flash_attn_func
+            except ImportError:
+                print("Warning: flash-attn-rocm not installed, using SDPA fallback")
+                return sdpa_attention
+        else:
+            # NVIDIA path - use kernels package
+            try:
+                from kernels import get_kernel
+                cap = torch.cuda.get_device_capability()
+                repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+                fa3 = get_kernel(repo).flash_attn_interface
+                print(f"Using Flash Attention 3 from {repo}")
+                return fa3.flash_attn_func
+            except Exception as e:
+                print(f"Warning: Could not load Flash Attention: {e}, using SDPA")
+                return sdpa_attention
+    
+    return None
+
+
+def sdpa_attention(q, k, v, causal=True, window_size=(-1, -1)):
+    """
+    Scaled Dot Product Attention using PyTorch's native SDPA.
+    Works on Intel XPU, AMD ROCm (without flash-attn), and as NVIDIA fallback.
+    """
+    # SDPA doesn't support sliding window directly, so we use the standard causal mask
+    # For sliding window, we'd need to implement manually (fallback to eager)
+    if window_size[0] > 0:
+        # Use manual eager attention for sliding window
+        return eager_attention(q, k, v, causal, window_size)
+    
+    # Use PyTorch's SDPA
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            is_causal=causal
+        ).transpose(1, 2)
 
 
 def eager_attention(q, k, v, causal=True, window_size=(-1, -1)):
-    """Eager attention implementation as fallback for ROCm without flash-attn."""
+    """Eager attention implementation as fallback."""
     B, T, H, D = q.shape
     _, S, _, _ = k.shape
     
@@ -93,6 +163,26 @@ def eager_attention(q, k, v, causal=True, window_size=(-1, -1)):
     attn = torch.softmax(scores, dim=-1)
     out = torch.matmul(attn, v)
     return out
+
+
+# Global flash attention function (initialized lazily)
+_flash_attn_func = None
+_device_type = None
+
+def flash_attn_wrapper(q, k, v, causal=True, window_size=(-1, -1)):
+    """Wrapper that uses best available attention implementation."""
+    global _flash_attn_func, _device_type
+    if _flash_attn_func is None:
+        _device_type = get_device_type()
+        _flash_attn_func = get_flash_attention_fn(_device_type)
+    
+    if _flash_attn_func is not None:
+        try:
+            return _flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+        except Exception as e:
+            print(f"Warning: Attention function failed: {e}, using eager fallback")
+    
+    return eager_attention(q, k, v, causal, window_size)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -527,58 +617,74 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 # AMD ROCm / NVIDIA CUDA device setup
-def get_device():
-    """Get the best available device (ROCm or CUDA)."""
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-            print(f"Using AMD ROCm device: {device_name}")
+def get_peak_flops(device_type=None):
+    """Get peak BF16 FLOPS for the current device (Intel XPU / AMD / NVIDIA)."""
+    if device_type is None:
+        device_type = get_device_type()
+    
+    if device_type == "xpu":
+        # Intel XPU devices
+        device_name = torch.xpu.get_device_name(0).lower()
+        if 'max 1550' in device_name or 'ponte' in device_name:
+            return 419e12   # Intel Data Center GPU Max 1550 (Ponte Vecchio)
+        elif 'max 1100' in device_name:
+            return 266e12   # Intel Data Center GPU Max 1100
+        elif 'flex 170' in device_name:
+            return 104e12   # Intel Data Center GPU Flex 170
+        elif 'flex 140' in device_name:
+            return 52e12    # Intel Data Center GPU Flex 140
+        elif 'arc a770' in device_name:
+            return 138e12   # Intel Arc A770 ~138 TFLOPS FP16
+        elif 'arc a750' in device_name:
+            return 128e12   # Intel Arc A750 ~128 TFLOPS FP16
+        elif 'arc a580' in device_name:
+            return 97e12    # Intel Arc A580
         else:
-            print(f"Using NVIDIA CUDA device: {device_name}")
-        return torch.device("cuda")
-    raise RuntimeError("No GPU available - ROCm/CUDA required")
-
-def get_gpu_peak_flops():
-    """Get peak BF16 FLOPS for the current GPU (AMD or NVIDIA)."""
-    if not torch.cuda.is_available():
-        return 0
+            print(f"Warning: Unknown Intel XPU {device_name}, using conservative estimate")
+            return 100e12
     
-    device_name = torch.cuda.get_device_name(0).lower()
+    elif device_type == "cuda":
+        device_name = torch.cuda.get_device_name(0).lower()
+        # AMD GPUs (MI series)
+        if 'mi300x' in device_name or 'mi300' in device_name:
+            return 1300e12  # MI300X ~1.3 PFLOPS BF16
+        elif 'mi250x' in device_name or 'mi250' in device_name:
+            return 383e12   # MI250X ~383 TFLOPS BF16
+        elif 'mi210' in device_name:
+            return 181e12   # MI210 ~181 TFLOPS BF16
+        elif 'mi100' in device_name:
+            return 184e12   # MI100 ~184 TFLOPS BF16
+        # NVIDIA GPUs
+        elif 'h100' in device_name or 'h200' in device_name:
+            return 989.5e12  # H100 SXM5
+        elif 'a100' in device_name:
+            return 312e12    # A100 SXM4
+        elif 'l40s' in device_name:
+            return 183e12    # L40S
+        elif 'rtx 4090' in device_name:
+            return 82.6e12   # RTX 4090
+        elif 'rtx 3090' in device_name:
+            return 71e12     # RTX 3090
+        else:
+            print(f"Warning: Unknown GPU {device_name}, using conservative FLOPS estimate")
+            return 100e12
     
-    # AMD GPUs (MI series)
-    if 'mi300x' in device_name or 'mi300' in device_name:
-        return 1300e12  # MI300X ~1.3 PFLOPS BF16
-    elif 'mi250x' in device_name or 'mi250' in device_name:
-        return 383e12   # MI250X ~383 TFLOPS BF16
-    elif 'mi210' in device_name:
-        return 181e12   # MI210 ~181 TFLOPS BF16
-    elif 'mi100' in device_name:
-        return 184e12   # MI100 ~184 TFLOPS BF16
-    # NVIDIA GPUs
-    elif 'h100' in device_name or 'h200' in device_name:
-        return 989.5e12  # H100 SXM5
-    elif 'a100' in device_name:
-        return 312e12    # A100 SXM4
-    elif 'l40s' in device_name:
-        return 183e12    # L40S
-    elif 'rtx 4090' in device_name:
-        return 82.6e12   # RTX 4090
-    elif 'rtx 3090' in device_name:
-        return 71e12     # RTX 3090
-    else:
-        # Default conservative estimate
-        print(f"Warning: Unknown GPU {device_name}, using conservative FLOPS estimate")
-        return 100e12
+    return 100e12
 
+# Setup device and training context
+_device_type = get_device_type()
 device = get_device()
 torch.manual_seed(42)
-if hasattr(torch.cuda, 'manual_seed'):
-    torch.cuda.manual_seed(42)
+device_manual_seed(42, _device_type)
 torch.set_float32_matmul_precision("high")
 
-# ROCm uses same autocast interface as CUDA
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-GPU_BF16_PEAK_FLOPS = get_gpu_peak_flops()
+# Autocast context for the device
+if _device_type == "xpu":
+    autocast_ctx = torch.amp.autocast(device_type="xpu", dtype=torch.bfloat16)
+else:
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+GPU_BF16_PEAK_FLOPS = get_peak_flops(_device_type)
 print(f"Peak BF16 FLOPS: {GPU_BF16_PEAK_FLOPS/1e12:.1f} TFLOPS")
 
 tokenizer = Tokenizer.from_directory()
@@ -626,7 +732,7 @@ optimizer = model.setup_optimizer(
 
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=_device_type)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -660,8 +766,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    if hasattr(torch.cuda, 'synchronize'):
-        torch.cuda.synchronize()
+    device_synchronize(_device_type)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -691,8 +796,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    if hasattr(torch.cuda, 'synchronize'):
-        torch.cuda.synchronize()
+    device_synchronize(_device_type)
     t1 = time.time()
     dt = t1 - t0
 
@@ -737,10 +841,7 @@ with autocast_ctx:
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-if hasattr(torch.cuda, 'max_memory_allocated'):
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-else:
-    peak_vram_mb = 0  # Fallback if not available
+peak_vram_mb = get_max_memory_allocated(_device_type) / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

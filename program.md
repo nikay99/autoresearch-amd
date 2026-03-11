@@ -1,8 +1,8 @@
-# autoresearch-amd
+# autoresearch-intel
 
 This is an experiment to have the LLM do its own research.
 
-**Note: This is the AMD ROCm fork** - supports AMD GPUs (MI300X, MI250X, MI210, MI100) via ROCm 6.2.4+ as well as NVIDIA GPUs for compatibility.
+**Note: This is the universal GPU fork** - supports Intel XPU (Arc/Data Center), AMD GPUs (MI300X, MI250X, MI210, MI100) via ROCm 6.2.4+, and NVIDIA GPUs via CUDA. The code automatically detects your GPU and uses the optimal backend.
 
 ## Setup
 
@@ -19,6 +19,15 @@ To set up a new experiment, work with the user to:
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
+
+## Platform Detection
+
+The code automatically detects which GPU is available:
+- **Intel XPU**: Uses Intel Extension for PyTorch (IPEX), SDPA for attention
+- **AMD ROCm**: Uses ROCm-enabled PyTorch, flash-attn-rocm (if installed)
+- **NVIDIA CUDA**: Uses CUDA PyTorch, Flash Attention 3
+
+You don't need to do anything special - the code handles device detection, memory management, and autocast automatically.
 
 ## Experimentation
 

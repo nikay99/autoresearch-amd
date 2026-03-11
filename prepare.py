@@ -273,14 +273,28 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def _get_device():
+    """Detect available accelerator: 'xpu' (Intel), 'cuda' (AMD/NVIDIA), or 'cpu'."""
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return "xpu"
+    elif torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
     When no document fits remaining space, crops shortest doc to fill exactly.
     100% utilization (no padding).
+    
+    Args:
+        device: Target device ('cuda', 'xpu', or None for auto-detect)
     """
     assert split in ["train", "val"]
+    if device is None:
+        device = _get_device()
+    
     row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
@@ -295,8 +309,10 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=torch.cuda.is_available())
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    # Pin memory only for CUDA (improves CPU->GPU transfer)
+    pin_mem = (device == "cuda") and torch.cuda.is_available()
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_mem)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -349,7 +365,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=_get_device())
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
